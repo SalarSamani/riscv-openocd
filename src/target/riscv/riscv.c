@@ -489,7 +489,7 @@ static struct riscv_private_config *alloc_default_riscv_private_config(void)
 	return config;
 }
 
-static int riscv_create_target(struct target *target)
+static int riscv_create_target(struct target *target, Jim_Interp *interp)
 {
 	LOG_TARGET_DEBUG(target, "riscv_create_target()");
 	struct riscv_private_config *config = target->private_config;
@@ -3035,8 +3035,23 @@ static int riscv_mmu(struct target *target, int *enabled)
 	unsigned int xlen = riscv_xlen(target);
 
 	if (v_mode) {
-		/* In VU or VS mode, MMU is considered enabled when
-		 * either hgatp or vsatp mode is not OFF */
+		/* vsatp and hgatp registers are considered active for the
+		 * purposes of the address-translation algorithm unless the
+		 * effective privilege mode is U and hstatus.HU=0. */
+		if (effective_mode == PRV_U) {
+			riscv_reg_t hstatus;
+			if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) != ERROR_OK) {
+				LOG_TARGET_ERROR(target, "Failed to read hstatus register.");
+				return ERROR_FAIL;
+			}
+
+			if (get_field(hstatus, HSTATUS_HU) == 0)
+				/* In hypervisor mode regular satp translation
+				 * doesn't happen. */
+				return ERROR_OK;
+
+		}
+
 		riscv_reg_t vsatp;
 		if (riscv_reg_get(target, &vsatp, GDB_REGNO_VSATP) != ERROR_OK) {
 			LOG_TARGET_ERROR(target, "Failed to read vsatp register; priv=0x%" PRIx64,
@@ -3044,7 +3059,7 @@ static int riscv_mmu(struct target *target, int *enabled)
 			return ERROR_FAIL;
 		}
 		/* vsatp is identical to satp, so we can use the satp macros. */
-		if (get_field(vsatp, RISCV_SATP_MODE(xlen)) != SATP_MODE_OFF) {
+		if (RISCV_SATP_MODE(xlen) != SATP_MODE_OFF) {
 			LOG_TARGET_DEBUG(target, "VS-stage translation is enabled.");
 			*enabled = 1;
 			return ERROR_OK;
@@ -3056,7 +3071,7 @@ static int riscv_mmu(struct target *target, int *enabled)
 					priv);
 			return ERROR_FAIL;
 		}
-		if (get_field(hgatp, RISCV_HGATP_MODE(xlen)) != HGATP_MODE_OFF) {
+		if (RISCV_HGATP_MODE(xlen) != HGATP_MODE_OFF) {
 			LOG_TARGET_DEBUG(target, "G-stage address translation is enabled.");
 			*enabled = 1;
 		} else {
@@ -3089,6 +3104,7 @@ static int riscv_mmu(struct target *target, int *enabled)
 	return ERROR_OK;
 }
 
+#if 0
 /* Translate address from virtual to physical, using info and ppn.
  * If extra_info is non-NULL, then translate page table accesses for the primary
  * translation using extra_info and extra_ppn. */
@@ -3185,6 +3201,108 @@ static int riscv_address_translate(struct target *target,
 			 info->name, virtual, *physical);
 	return ERROR_OK;
 }
+#else
+/* Translate address from virtual to physical, using info and ppn.
+ * If extra_info is non-NULL, then translate page table accesses for the primary
+ * translation using extra_info and extra_ppn. */
+static int riscv_address_translate(struct target *target,
+		const virt2phys_info_t *info, target_addr_t ppn,
+		const virt2phys_info_t *extra_info, target_addr_t extra_ppn,
+		target_addr_t virtual, target_addr_t *physical)
+{
+	RISCV_INFO(r);
+	unsigned int xlen = riscv_xlen(target);
+
+	LOG_TARGET_DEBUG(target, "mode=%s; ppn=0x%" TARGET_PRIxADDR "; virtual=0x%" TARGET_PRIxADDR,
+		info->name, ppn, virtual);
+
+	/* verify bits xlen-1:va_bits-1 are all equal */
+	assert(xlen >= info->va_bits);
+	target_addr_t mask = ((target_addr_t)1 << (xlen - (info->va_bits - 1))) - 1;
+	target_addr_t masked_msbs = (virtual >> (info->va_bits - 1)) & mask;
+	if (masked_msbs != 0 && masked_msbs != mask) {
+		LOG_TARGET_ERROR(target, "Virtual address 0x%" TARGET_PRIxADDR " is not sign-extended "
+				"for %s mode.", virtual, info->name);
+		return ERROR_FAIL;
+	}
+
+	target_addr_t table_address = ppn << 8;
+
+	target_addr_t linear_idx = (virtual >> 24) & 0xFF;
+	target_addr_t linear_pte_paddr = table_address + 4 * linear_idx;
+
+	uint8_t buffer[8];
+	const riscv_mem_access_args_t args1 = {
+		.address = linear_pte_paddr,
+		.read_buffer = buffer,
+		.size = 4,
+		.increment = 4,
+		.count = (1 << info->pte_shift) / 4,
+	};
+	int retval = r->access_memory(target, args1);
+	if (retval != ERROR_OK)
+		return ERROR_FAIL;
+
+	target_addr_t linear_pte = buf_get_u32(buffer, 0, 32);	
+	target_addr_t linear_ppn = linear_pte & 0xFFFFFFF0;
+
+
+	target_addr_t exp_vpn = (virtual >> 8) & 0xFFFF;
+	target_addr_t exp_page_selector = 4;
+	target_addr_t exp_idx = 0;
+	do
+	{
+		exp_page_selector--;
+		exp_idx = ((exp_vpn >> (4 * exp_page_selector)) & 0xF);
+		if (exp_idx != 0) {
+		break;
+		}
+	} while (exp_page_selector > 0);
+	target_addr_t offset = virtual & ((1 << (8 + exp_page_selector * 4)) - 1) & 0xFFFFFFFF;
+
+
+
+
+	target_addr_t exp_base_paddr = linear_ppn + exp_page_selector * 4;
+	const riscv_mem_access_args_t args2 = {
+		.address = exp_base_paddr,
+		.read_buffer = buffer,
+		.size = 4,
+		.increment = 4,
+		.count = (1 << info->pte_shift) / 4,
+	};
+	retval = r->access_memory(target, args2);
+	if (retval != ERROR_OK)
+		return ERROR_FAIL;
+
+	target_addr_t exp_base = buf_get_u32(buffer, 0, 32);
+
+
+	target_addr_t exp_pte_paddr = exp_base + 4 * exp_idx;
+	const riscv_mem_access_args_t args3 = {
+		.address = exp_pte_paddr,
+		.read_buffer = buffer,
+		.size = 4,
+		.increment = 4,
+		.count = (1 << info->pte_shift) / 4,
+	};
+	retval = r->access_memory(target, args3);
+	if (retval != ERROR_OK)
+		return ERROR_FAIL;
+
+	target_addr_t exp_pte = buf_get_u32(buffer, 0, 32);
+	target_addr_t exp_ppn = (exp_pte & ~(((target_addr_t)1 << (8 + exp_page_selector * 4)) - 1) & 0xFFFFFFFF) >> (8 + exp_page_selector * 4);
+
+
+	target_addr_t page_base = exp_ppn << (8 + exp_page_selector * 4);
+	*physical = page_base | offset;
+
+
+	LOG_TARGET_DEBUG(target, "mode=%s; 0x%" TARGET_PRIxADDR " -> 0x%" TARGET_PRIxADDR,
+			 info->name, virtual, *physical);
+	return ERROR_OK;
+}
+#endif
 
 /* Virtual to physical translation for hypervisor mode. */
 static int riscv_virt2phys_v(struct target *target, target_addr_t virtual, target_addr_t *physical)
@@ -3350,7 +3468,7 @@ static int riscv_virt2phys(struct target *target, target_addr_t virtual, target_
 	}
 
 	return riscv_address_translate(target,
-			satp_info, get_field(satp_value, RISCV_SATP_PPN(xlen)),
+			satp_info, ((satp_value) & 0x00FFFFFF),
 			NULL, 0,
 			virtual, physical);
 }
